@@ -1,0 +1,61 @@
+//@version=6
+//─────────────────────────────────────────────────────────────────────
+//  Trade-Score v1  ©2025 chaser_sol  (all fixes applied)
+//─────────────────────────────────────────────────────────────────────
+indicator("Trade-Score v1", overlay = false, max_lines_count = 1, max_labels_count = 1)
+
+// ───── inputs ─────
+emaHitWeight      = input.int(35, "Weight ▸ EMA 21/55 cross" , 0, 100)
+fvgTapWeight      = input.int(35, "Weight ▸ FVG tap"         , 0, 100)
+patternWeight     = input.int(30, "Weight ▸ Pattern trigger" , 0, 100)
+htfBiasWeight     = input.int(10, "Weight ▸ HTF bias filter" , 0, 100)
+scoreAlertThresh  = input.int(65, "Alert threshold"          , 0, 100)
+htfTF             = input.timeframe("60", "HTF for bias")               // 60 = 1 h
+debug             = input.bool(false, "Plot sub-scores?")
+
+// ───── replace these three placeholders with your live 0/1 series ─────
+ema21_55_cross   = 0  // <- plug in ema21_55_cross bool stream
+fvg_tap_trigger  = 0  // <- plug in fvg_tap_trigger  bool stream
+pattern_breakout = 0  // <- plug in pattern_breakout bool stream
+// ──────────────────────────────────────────────────────────────────────
+
+emaHit     = ema21_55_cross
+fvgTap     = fvg_tap_trigger
+patternHit = pattern_breakout
+
+// HTF bias (+1 long, −1 short, 0 neutral)
+htfBiasRaw = request.security(syminfo.tickerid, htfTF,
+                              ta.ema(close, 55) - ta.ema(close, 200))
+htfBias    = htfBiasRaw > 0 ? 1 : htfBiasRaw < 0 ? -1 : 0
+
+// composite score
+longScore  = emaHit * emaHitWeight +
+             fvgTap * fvgTapWeight +
+             patternHit * patternWeight
+
+longScore += (htfBias ==  1 ?  htfBiasWeight :
+              htfBias == -1 ? -htfBiasWeight : 0)
+
+score      = math.max(0, math.min(longScore, 100))           // clamp 0-100
+
+plot(debug ? score : na, "Score", color = color.new(color.blue, 0))
+
+// JSON payload (single-line)
+tradeSide  = score >= scoreAlertThresh
+              ? (htfBias == -1 ? "SHORT" : "LONG")
+              : "PASS"
+
+jsonAlert  = '{"pair":"' + syminfo.ticker +
+             '","tf":"'   + timeframe.period +
+             '","score":' + str.tostring(score) +
+             ',"side":"'  + tradeSide +
+             '","module":"trade_score"}'
+
+// runtime alert
+if score >= scoreAlertThresh
+    alert(jsonAlert, alert.freq_once_per_bar_close)
+
+// static rule so you can create the alert in the UI
+alertcondition(score >= scoreAlertThresh,
+               title   = "🚦 Trade-Score",
+               message = "Trade-Score threshold met")
