@@ -1,0 +1,181 @@
+//  Combo Confirmed FVG
+//  © Enhanced FVG with EMA confirmation
+//@version=6
+indicator("Combo Confirmed FVG", overlay=true, max_boxes_count=500, max_labels_count=100)
+
+// ───── INPUTS ─────
+FVG_life_bars   = input.int(100, "FVG life (bars)", minval=20, maxval=400)
+min_gap_pct     = input.float(0.25, "Min gap %", minval=0.01, maxval=1, step=0.01) / 100
+box_alpha       = input.int(40, "Box transparency", minval=0, maxval=100)
+fillPct         = input.float(0.75, "Fill % to count as tap", minval=0.1, maxval=1, step=0.05)
+hide_after_fill = input.bool(true, "Hide box once filled")
+show_labels     = input.bool(false, "Show FVG labels")
+enable_alerts   = input.bool(true, "Enable alerts")
+
+// ───── EMA CALCULATIONS ─────
+emaFast = ta.ema(close, 21)
+emaSlow = ta.ema(close, 55)
+
+// Plot EMAs
+plot(emaFast, title="EMA 21", linewidth=2, color=color.orange)
+plot(emaSlow, title="EMA 55", linewidth=2, color=color.blue)
+
+// ───── HELPER FUNCTIONS ─────
+// Check if two price ranges overlap
+overlaps(t1, b1, t2, b2) =>
+    not (t1 <= b2 or b1 >= t2)
+
+// ───── FVG DETECTION LOGIC ─────
+// Standard 3-bar FVG detection
+bullBar = close[1] > open[1]
+bearBar = close[1] < open[1]
+
+// Bullish FVG: Gap up where previous high < current low
+fvgBull = bullBar and high[2] < low[0] and low[1] <= high[2] and high[1] >= low[0]
+
+// Bearish FVG: Gap down where previous low > current high  
+fvgBear = bearBar and low[2] > high[0] and high[1] <= low[2] and low[1] >= high[0]
+
+// Calculate gap sizes
+gapSizeBull = low[0] - high[2]
+gapSizeBear = low[2] - high[0]
+
+// Percentage-based gap size validation
+gapPctBull = gapSizeBull / close
+gapPctBear = gapSizeBear / close
+
+// Valid FVGs based on minimum percentage
+validBullFVG = fvgBull and gapPctBull >= min_gap_pct
+validBearFVG = fvgBear and gapPctBear >= min_gap_pct
+
+// ───── STORAGE ARRAYS ─────
+var array<box> gaps = array.new<box>()
+var array<bool> isBullArr = array.new<bool>()
+var array<label> labels = array.new<label>()
+
+// ───── CLEANUP OLD BOXES ─────
+if array.size(gaps) > 0
+    i = array.size(gaps) - 1
+    while i >= 0
+        currentBox = array.get(gaps, i)
+        if box.get_right(currentBox) < bar_index - FVG_life_bars
+            // Delete box
+            box.delete(currentBox)
+            array.remove(gaps, i)
+            array.remove(isBullArr, i)
+            
+            // Delete corresponding label if it exists
+            if i < array.size(labels)
+                currentLabel = array.get(labels, i)
+                if not na(currentLabel)
+                    label.delete(currentLabel)
+                array.remove(labels, i)
+        i -= 1
+
+// ───── CREATE FVG FUNCTION ─────
+createFVG(top, bottom, isBull) =>
+    // Check for overlapping FVGs of the same type to avoid duplicates
+    shouldCreate = true
+    
+    if array.size(gaps) > 0
+        for j = 0 to array.size(gaps) - 1
+            existingBox = array.get(gaps, j)
+            existingIsBull = array.get(isBullArr, j)
+            
+            // Only check against same type (bull/bear)
+            if existingIsBull == isBull
+                existingTop = box.get_top(existingBox)
+                existingBottom = box.get_bottom(existingBox)
+                
+                // If ranges overlap significantly, don't create new one
+                if overlaps(top, bottom, existingTop, existingBottom)
+                    shouldCreate := false
+                    break
+    
+    if shouldCreate
+        // Set colors and transparency
+        baseColor = isBull ? color.green : color.red
+        boxColor = color.new(baseColor, box_alpha)
+        borderColor = color.new(baseColor, 0)
+        
+        // Create the box
+        newBox = box.new(bar_index - 1, top, bar_index + FVG_life_bars, bottom, border_color=borderColor, bgcolor=boxColor, border_width=1)
+        
+        // Store the box and its properties
+        array.push(gaps, newBox)
+        array.push(isBullArr, isBull)
+        
+        // Create label if enabled
+        newLabel = label(na)
+        if show_labels
+            labelY = isBull ? top : bottom
+            labelStyle = isBull ? label.style_label_down : label.style_label_up
+            newLabel := label.new(bar_index - 1, labelY, "FVG", style=labelStyle, color=color.new(baseColor, 0), textcolor=color.white, size=size.small)
+        
+        array.push(labels, newLabel)
+        
+        // Return true if FVG was created
+        true
+    else
+        false
+
+// ───── EXECUTE FVG CREATION ─────
+if validBullFVG
+    createFVG(low[0], high[2], true)
+
+if validBearFVG
+    createFVG(low[2], high[0], false)
+
+// ───── COMBO TAP DETECTION & ALERTS ─────
+var bool comboTap = false
+comboTap := false
+
+if array.size(gaps) > 0
+    for k = array.size(gaps) - 1 to 0
+        currentGap = array.get(gaps, k)
+        gapTop = box.get_top(currentGap)
+        gapBottom = box.get_bottom(currentGap)
+        gapHeight = gapTop - gapBottom
+        
+        // Check if price is within the gap
+        if close <= gapTop and close >= gapBottom
+            // Calculate fill percentage
+            fillPercent = 0.0
+            isBullGap = array.get(isBullArr, k)
+            
+            if isBullGap // Bullish gap
+                fillFromBottom = close - gapBottom
+                fillPercent := fillFromBottom / gapHeight
+            else // Bearish gap
+                fillFromTop = gapTop - close
+                fillPercent := fillFromTop / gapHeight
+            
+            // Check if fill percentage threshold is met AND EMA confirmation
+            if fillPercent >= fillPct
+                // EMA confirmation logic
+                emaConfirmed = false
+                if isBullGap and emaFast > emaSlow
+                    emaConfirmed := true
+                else if not isBullGap and emaFast < emaSlow
+                    emaConfirmed := true
+                
+                if emaConfirmed
+                    comboTap := true
+                    
+                    if hide_after_fill
+                        // Delete the box
+                        box.delete(currentGap)
+                        array.remove(gaps, k)
+                        array.remove(isBullArr, k)
+                        
+                        // Delete corresponding label
+                        if k < array.size(labels)
+                            currentLabel = array.get(labels, k)
+                            if not na(currentLabel)
+                                label.delete(currentLabel)
+                            array.remove(labels, k)
+                    
+                    break // Only process one combo tap per bar
+
+// ───── ALERT CONDITION ─────
+alertcondition(enable_alerts and comboTap, title="⚡ Combo FVG Confirmed", message="{\"content\":\"⚡ {{ticker}} ({{interval}}) triggered a COMBO FVG ENTRY.\"}")
