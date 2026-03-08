@@ -1,0 +1,1312 @@
+// ============================================================================
+// StrikeZone — Bias Flip (MSA + EMA) v6
+// ============================================================================
+//
+// PURPOSE:
+//   A "Bias Flip" / "Regime Switch" alert layer that combines:
+//     1) Market Structure Analysis (swing pivots, BOS/CHoCH, trend state)
+//     2) EMA 21/55 trend filtering
+//   into a unified bias signal. It tells you: "What side of the market
+//   should I be on RIGHT NOW?" — and alerts you the moment that changes.
+//
+// HOW IT WORKS (Mental Model):
+//   Think of it like a traffic light for your trading bias:
+//     - GREEN (Bullish Bias): Structure flipped bullish + EMA confirms uptrend
+//     - RED   (Bearish Bias): Structure flipped bearish + EMA confirms downtrend
+//     - GRAY  (Unknown):      Waiting for first confirmed flip
+//
+//   The key insight is that we DON'T flip on every BOS or CHoCH. We only flip
+//   when a REVERSAL signal (CHoCH) occurs AND the EMA trend agrees. This filters
+//   out a lot of noise and false reversals.
+//
+// ARCHITECTURE:
+//   The indicator runs THREE state machines in parallel:
+//     1) trendState  — MSA's raw structure direction (+1 bull, -1 bear, 0 init)
+//     2) emaTrend    — EMA fast vs slow alignment (+1 bull, -1 bear)
+//     3) biasState   — The FINAL output bias (+1 bull, -1 bear, 0 unknown)
+//
+//   biasState only changes when specific conditions align (configurable via
+//   confirmationMode input). This is the value you trade.
+//
+// ALERT SYSTEM:
+//   Fires Discord-compatible JSON webhook alerts via alert() with:
+//   - Rich embed cards with colored sidebar (green/red/orange)
+//   - Structured fields: Symbol, TF, Mode, Reason, Levels, Action, etc.
+//   - Fallback to clean markdown "content" mode if embeds disabled
+//   - Compact mode option for shorter, scannable alerts
+//   - Non-repainting (barstate.isconfirmed + freq_once_per_bar_close)
+//
+// Author: Built with Pine Script v6 best practices
+// Version: 2.0 (Embed Alert Upgrade)
+// ============================================================================
+
+//@version=6
+indicator("StrikeZone — Bias Flip (MSA + EMA) v6",
+     shorttitle = "SZ Bias Flip",
+     overlay    = true,
+     max_lines_count  = 500,
+     max_labels_count = 500)
+
+// ============================================================================
+// SECTION 1: USER INPUTS
+// ============================================================================
+// We organize inputs into logical groups. This isn't just cosmetic — it makes
+// the Settings panel in TradingView much easier to navigate. Each group maps
+// to a "tab" in the settings dialog.
+//
+// PRO TIP FOR NEW DEVS: The `tooltip` parameter is your documentation layer.
+// Users hover over the (?) icon and see your explanation. Always write tooltips
+// as if the user has never seen your indicator before.
+// ============================================================================
+
+// --- Structure Detection Group ---
+// These control the MSA (Market Structure Analyzer) engine.
+// The swing detection finds pivot points, and break detection determines
+// whether price has broken above/below those pivots.
+
+grpStructure = "Structure Detection (MSA)"
+
+swingLen = input.int(12, "Swing Length",
+     minval = 1, maxval = 50,
+     tooltip = "Bars to left AND right to confirm a swing pivot.\n" +
+               "Higher = fewer but more significant swings.\n" +
+               "Lower = more swings, more signals, more noise.\n" +
+               "Recommended: 8-15 for intraday, 12-20 for daily+.",
+     group = grpStructure)
+
+breakMode = input.string("Close", "Break Confirmation Mode",
+     options = ["Close", "Wick"],
+     tooltip = "How we confirm a structure break:\n" +
+               "Close: Candle must CLOSE beyond the level (safer, fewer false breaks)\n" +
+               "Wick: High/Low touching beyond level counts (faster, more signals)",
+     group = grpStructure)
+
+atrBufferEnabled = input.bool(false, "Enable ATR Buffer",
+     tooltip = "Adds a buffer zone around swing levels.\n" +
+               "Price must break level + buffer to trigger.\n" +
+               "Helps reduce false breaks in choppy/ranging markets.",
+     group = grpStructure)
+
+atrLen = input.int(14, "ATR Length",
+     minval = 1, maxval = 100,
+     group = grpStructure)
+
+atrBufferMult = input.float(0.0, "ATR Buffer Multiplier",
+     minval = 0.0, maxval = 2.0, step = 0.1,
+     tooltip = "How many ATRs beyond the level price must break.\n" +
+               "0.0 = no buffer. 0.5 = half ATR. 1.0 = full ATR.",
+     group = grpStructure)
+
+// --- EMA Trend Filter Group ---
+// The EMA system acts as a "trend confirmation" layer.
+// We don't trade structure signals that go against the EMA trend.
+// Think of EMAs as the "wind direction" — you want to sail WITH the wind.
+
+grpEma = "EMA Trend Filter"
+
+fastEmaLen = input.int(21, "Fast EMA Length",
+     minval = 1,
+     tooltip = "The responsive EMA. Reacts quickly to price changes.\n" +
+               "21 is a popular choice (roughly one trading month).",
+     group = grpEma)
+
+slowEmaLen = input.int(55, "Slow EMA Length",
+     minval = 1,
+     tooltip = "The anchor EMA. Moves slowly, shows the bigger trend.\n" +
+               "55 is a Fibonacci number and widely used institutional level.",
+     group = grpEma)
+
+// --- Bias Flip Logic Group ---
+// This is the CORE configuration — how do we decide when bias flips?
+// Different modes offer different tradeoffs between speed and reliability.
+
+grpBias = "Bias Flip Logic"
+
+confirmationMode = input.string("CHoCH+EMA", "Confirmation Mode",
+     options = ["CHoCH+EMA", "CHoCHOnly", "CHoCHThenBOS", "CHoCHThenBOS+EMA"],
+     tooltip = "How bias flips are confirmed:\n\n" +
+               "CHoCH+EMA (default, recommended):\n" +
+               "  Flip when CHoCH occurs AND EMA trend aligns.\n" +
+               "  Best balance of speed and reliability.\n\n" +
+               "CHoCHOnly:\n" +
+               "  Flip immediately on any CHoCH. Fastest but noisiest.\n" +
+               "  Good for scalping or very active markets.\n\n" +
+               "CHoCHThenBOS:\n" +
+               "  CHoCH sets a 'pending' flip, confirmed only when\n" +
+               "  a BOS follows in the same direction. Most conservative.\n\n" +
+               "CHoCHThenBOS+EMA:\n" +
+               "  Same as above, but EMA must also align on the\n" +
+               "  confirming BOS bar. Maximum confirmation.",
+     group = grpBias)
+
+requireBarClose = input.bool(true, "Require Bar Close (Non-Repaint)",
+     tooltip = "When ON: Signals only fire after bar closes.\n" +
+               "This prevents repainting (signals that appear then disappear).\n" +
+               "STRONGLY recommended to keep ON for live trading.",
+     group = grpBias)
+
+minBarsBetweenFlips = input.int(20, "Min Bars Between Bias Flips",
+     minval = 1, maxval = 200,
+     tooltip = "Cooldown period after a bias flip.\n" +
+               "Prevents rapid flip-flopping in choppy markets.\n" +
+               "20 bars is a good default for most timeframes.",
+     group = grpBias)
+
+// --- Alert Group ---
+grpAlerts = "Alerts"
+
+enableAlerts = input.bool(true, "Enable Alerts", group = grpAlerts)
+
+alertBullFlip = input.bool(true, "Alert Bullish Bias Flip", group = grpAlerts)
+
+alertBearFlip = input.bool(true, "Alert Bearish Bias Flip", group = grpAlerts)
+
+enableEarlyWarning = input.bool(false, "Enable Early Warning Alerts",
+     tooltip = "Send an alert when CHoCH occurs BEFORE full bias confirmation.\n" +
+               "Useful for heads-up notifications. Labeled as 'EARLY WARNING'\n" +
+               "so you don't confuse them with confirmed flips.",
+     group = grpAlerts)
+
+useEmbeds = input.bool(true, "Use Discord Embeds (Rich Cards)",
+     tooltip = "When ON: Alerts use Discord's embed format with colored\n" +
+               "sidebar, structured fields, and premium card layout.\n" +
+               "When OFF: Falls back to a clean markdown 'content' payload.\n" +
+               "Use OFF only if your webhook target doesn't support embeds.",
+     group = grpAlerts)
+
+compactMode = input.bool(false, "Compact Alert Mode",
+     tooltip = "When ON: Omits the Meaning, Action, and Invalidation fields\n" +
+               "from alerts. Produces shorter, scannable notifications.\n" +
+               "When OFF: Full educational context included in every alert.",
+     group = grpAlerts)
+
+// --- Display Group ---
+grpDisplay = "Display"
+
+showBgShading = input.bool(true, "Background Shading (Bias State)",
+     tooltip = "Faint green/red background showing current bias.",
+     group = grpDisplay)
+
+showFlipLabels = input.bool(true, "Show Bias Flip Labels",
+     tooltip = "Display 'BIAS FLIP ↑' / 'BIAS FLIP ↓' labels on chart.",
+     group = grpDisplay)
+
+showEMAs = input.bool(true, "Plot EMA Lines", group = grpDisplay)
+
+showSwingLevels = input.bool(true, "Show Swing Level Lines", group = grpDisplay)
+
+showInfoPanel = input.bool(true, "Show Status Panel",
+     tooltip = "Small table showing current biasState, emaTrend, trendState, and last swing levels.",
+     group = grpDisplay)
+
+labelSize = input.string("small", "Label Size",
+     options = ["tiny", "small", "normal"],
+     group = grpDisplay)
+
+maxEventsToKeep = input.int(10, "Max Labels to Display",
+     minval = 1, maxval = 50,
+     group = grpDisplay)
+
+
+// ============================================================================
+// SECTION 2: COLOR DEFINITIONS
+// ============================================================================
+// Centralizing colors as constants makes the code WAY easier to maintain.
+// Want to change the bullish flip color? Change it in ONE place, not twenty.
+//
+// DESIGN PRINCIPLE: Bias Flip colors should be DISTINCT from BOS/CHoCH colors
+// so the user can instantly tell "this is a BIAS event, not just a structure event."
+// We use blue/magenta for bias flips vs green/red/teal/orange for structure.
+// ============================================================================
+
+// --- Bias Flip Colors (the main event) ---
+color COLOR_FLIP_BULL   = color.new(#00BFFF, 0)   // Deep sky blue — bullish flip
+color COLOR_FLIP_BEAR   = color.new(#FF1493, 0)   // Deep pink — bearish flip
+
+// --- Structure Event Colors (MSA inherited) ---
+color COLOR_BOS_BULL    = color.new(color.green,  0)
+color COLOR_BOS_BEAR    = color.new(color.red,    0)
+color COLOR_CHOCH_BULL  = color.new(color.teal,   0)
+color COLOR_CHOCH_BEAR  = color.new(color.orange,  0)
+
+// --- Swing Level Line Colors ---
+color COLOR_SWING_HIGH  = color.new(color.red,   50)
+color COLOR_SWING_LOW   = color.new(color.green, 50)
+
+// --- Background Colors (very faint so they don't obscure candles) ---
+color COLOR_BG_BULL     = color.new(color.green, 92)
+color COLOR_BG_BEAR     = color.new(color.red,   92)
+
+
+// ============================================================================
+// SECTION 3: GLOBAL-SCOPE STATEFUL CALCULATIONS
+// ============================================================================
+// THIS IS CRITICAL IN PINE SCRIPT v6.
+//
+// Pine v6 introduced "lazy boolean evaluation" (short-circuit logic):
+//   - `condition1 and condition2` — if condition1 is false, condition2 is SKIPPED
+//   - This is great for performance but DEADLY for stateful functions
+//
+// Why? Functions like ta.ema(), ta.atr(), ta.pivothigh() maintain internal
+// history. If they get "skipped" on some bars due to lazy eval, their history
+// becomes corrupted and values go haywire.
+//
+// THE FIX: Calculate ALL stateful series at GLOBAL scope (top level), BEFORE
+// using them in any `if` block or `and`/`or` expression.
+//
+// This is like prepping all your ingredients before you start cooking.
+// You don't want to be chopping onions mid-stir-fry.
+// ============================================================================
+
+// --- EMA Calculations (global scope — NEVER put these inside an if block) ---
+emaFast = ta.ema(close, fastEmaLen)
+emaSlow = ta.ema(close, slowEmaLen)
+
+// --- ATR Calculation (global scope) ---
+// Even if ATR buffer is disabled, we calculate it every bar to keep history clean.
+// The cost is negligible and prevents lazy-eval corruption.
+atrValue = ta.atr(atrLen)
+
+// --- Pivot Detection (global scope) ---
+// ta.pivothigh/low return the HIGH/LOW value if a pivot was confirmed, else na.
+// Pivots confirm swingLen bars AFTER they actually occurred (built-in lag).
+// This lag is a FEATURE, not a bug — it ensures pivots are confirmed and stable.
+pivotHigh = ta.pivothigh(high, swingLen, swingLen)
+pivotLow  = ta.pivotlow(low,  swingLen, swingLen)
+
+// --- EMA Trend Direction ---
+// Simple comparison: which EMA is on top?
+// +1 = fast above slow (bullish trend)
+// -1 = fast below slow (bearish trend)
+int emaTrend = emaFast > emaSlow ? 1 : -1
+
+
+// ============================================================================
+// SECTION 4: STATE VARIABLES (Persisted Across Bars)
+// ============================================================================
+// The `var` keyword is one of Pine Script's most important features.
+//
+// WITHOUT var: variable resets to its initial value on EVERY bar.
+// WITH    var: variable initializes ONCE and keeps its value across all bars.
+//
+// Think of `var` like saving your game progress. Without it, you'd restart
+// from level 1 every single bar. With it, you pick up where you left off.
+//
+// We need persistence for:
+//   - Swing levels (track the last confirmed highs/lows)
+//   - Trend state (remember if we're bullish or bearish)
+//   - Bias state (the final output)
+//   - Cooldown tracking (when was the last flip?)
+//   - Pending flip state (for CHoCHThenBOS modes)
+// ============================================================================
+
+// --- Swing Level Tracking ---
+var float lastSwingHighLevel = na    // Price of last confirmed swing high
+var int   lastSwingHighBar   = na    // Bar index where it occurred
+var float lastSwingLowLevel  = na    // Price of last confirmed swing low
+var int   lastSwingLowBar    = na    // Bar index where it occurred
+
+// --- MSA Trend State Machine ---
+// This tracks the RAW structure direction based on BOS/CHoCH events.
+// +1 = bullish structure, -1 = bearish structure, 0 = unknown/init
+var int trendState = 0
+
+// --- Bias State (THE MAIN OUTPUT) ---
+// This is what the user trades. It only changes on confirmed bias flips.
+// +1 = bullish bias, -1 = bearish bias, 0 = unknown
+var int biasState = 0
+
+// --- Cooldown Tracking ---
+// Stores the bar_index of the last bias flip so we can enforce minimum spacing
+var int lastFlipBar = -999999
+
+// --- Pending Flip State (for CHoCHThenBOS modes) ---
+// When a CHoCH occurs but we need a follow-up BOS to confirm,
+// we store the "pending" direction here.
+// 0 = no pending flip, +1 = pending bullish, -1 = pending bearish
+var int pendingFlipDir = 0
+
+// --- Drawing Object Arrays ---
+// We store references to labels so we can clean up old ones
+var array<label> flipLabels = array.new_label()
+
+// --- Active Swing Level Lines ---
+var line activeHighLine = na
+var line activeLowLine  = na
+
+
+// ============================================================================
+// SECTION 5: HELPER FUNCTIONS
+// ============================================================================
+// Functions are your best friend in Pine Script. They:
+//   1) Make code readable (a name is worth a thousand comments)
+//   2) Reduce duplication (DRY — Don't Repeat Yourself)
+//   3) Make testing easier (isolate logic into small pieces)
+//
+// In Pine v6, functions must be DECLARED before they're CALLED.
+// Order matters! If function B calls function A, declare A first.
+// ============================================================================
+
+// --- Label Size Mapper ---
+// Maps our string input to Pine's built-in size constants.
+// Pine doesn't let you use strings directly for sizes, so we need this bridge.
+getLabelSize() =>
+    switch labelSize
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        => size.small
+
+// --- ATR Buffer Calculator ---
+// Returns how much "extra" price movement is needed beyond a swing level
+// for the break to count. Returns 0.0 if ATR buffer is disabled.
+getAtrBuffer() =>
+    atrBufferEnabled ? atrValue * atrBufferMult : 0.0
+
+// --- Break Detection: Has Price Broken ABOVE a Level? ---
+// Respects the breakMode setting (Close vs Wick).
+// Close mode: the candle body must close above the level.
+// Wick mode: the candle high touching above the level counts.
+hasBrokenAbove(float level, float buffer) =>
+    if na(level)
+        false
+    else
+        float breakPrice = breakMode == "Close" ? close : high
+        breakPrice > level + buffer
+
+// --- Break Detection: Has Price Broken BELOW a Level? ---
+hasBrokenBelow(float level, float buffer) =>
+    if na(level)
+        false
+    else
+        float breakPrice = breakMode == "Close" ? close : low
+        breakPrice < level - buffer
+
+// --- Drawing Cleanup ---
+// Prevents chart clutter by removing the oldest labels when we exceed our limit.
+// Without this, after hundreds of bars you'd have a mess of overlapping labels.
+cleanupOldLabels(array<label> labels, int maxItems) =>
+    while array.size(labels) > maxItems
+        label oldLabel = array.shift(labels)   // Remove from front (oldest)
+        label.delete(oldLabel)                 // Delete from chart
+
+// --- JSON String Escaper ---
+// THIS IS CRITICAL FOR WEBHOOK SAFETY.
+//
+// Why do we need this? Because our alert message gets embedded inside a JSON
+// string (between double quotes). If any of our dynamic content contains
+// characters that are special in JSON (like " or \ or newlines), the JSON
+// breaks and Discord rejects the webhook.
+//
+// Example without escaping:
+//   Symbol: NYSE:BRK"A  →  {"content":"...BRK"A..."}  →  BROKEN JSON!
+//
+// Example with escaping:
+//   Symbol: NYSE:BRK"A  →  {"content":"...BRK\"A..."}  →  Valid JSON ✓
+//
+// ORDER MATTERS: We escape backslashes FIRST, then quotes, then newlines.
+// If we escaped quotes first, we'd double-escape the backslashes we just added.
+jsonEscape(string s) =>
+    string result = str.replace_all(s,  "\\", "\\\\")   // Step 1: \ → \\
+    result := str.replace_all(result,   "\"", "\\\"")    // Step 2: " → \"
+    result := str.replace_all(result,   "\n", "\\n")     // Step 3: newline → \n
+    result
+
+// --- Timestamp Formatter ---
+// Creates a human-readable UTC/GMT timestamp for alert messages.
+formatTimestamp() =>
+    str.format_time(time, "yyyy-MM-dd HH:mm:ss", "GMT")
+
+// --- Bias State to Human-Readable String ---
+biasToString(int bias) =>
+    switch bias
+        1  => "BULLISH"
+        -1 => "BEARISH"
+        => "UNKNOWN"
+
+// --- Trend State to Human-Readable String ---
+trendToString(int trend) =>
+    switch trend
+        1  => "Bullish"
+        -1 => "Bearish"
+        => "Neutral"
+
+// --- EMA Trend to Human-Readable String ---
+emaTrendToString(int eTrend) =>
+    eTrend == 1 ? "Bullish (Fast > Slow)" : "Bearish (Fast < Slow)"
+
+// --- Build a Single Discord Embed Field (JSON Object) ---
+// Discord embeds use an array of "field" objects, each with:
+//   { "name": "Label", "value": "Content", "inline": true/false }
+//
+// `inline: true` places fields side-by-side (3 per row on desktop).
+// `inline: false` gives the field its own full-width row.
+//
+// WHY A HELPER? Because we build 7-9 fields per alert. Without this,
+// the concatenation code becomes an unreadable wall of quotes and braces.
+// This function encapsulates the escaping and structure so each field
+// is a clean one-liner in the calling code.
+buildEmbedField(string fieldName, string fieldValue, bool isInline) =>
+    '{"name":"' + jsonEscape(fieldName) + '","value":"' + jsonEscape(fieldValue) + '","inline":' + (isInline ? 'true' : 'false') + '}'
+
+// --- Get Trigger Mode Label ---
+// Maps the confirmationMode input to a clean, short label for the Reason field.
+// The triggerEvent string from Section 9 contains the full detail (e.g.
+// "CHoCH Bullish + EMA Aligned"), but for the "Trigger:" line we want
+// a concise, standardized label that matches what the user selected.
+getTriggerModeLabel() =>
+    switch confirmationMode
+        "CHoCH+EMA"        => "CHoCH + EMA"
+        "CHoCHOnly"        => "CHoCH Only"
+        "CHoCHThenBOS"     => "CHoCH → BOS"
+        "CHoCHThenBOS+EMA" => "CHoCH → BOS + EMA"
+        => confirmationMode
+
+// --- Get EMA Alignment Description ---
+// Returns a clean, standardized EMA status string.
+getEmaDesc() =>
+    emaTrend == 1
+         ? "EMA" + str.tostring(fastEmaLen) + " > EMA" + str.tostring(slowEmaLen)
+         : "EMA" + str.tostring(fastEmaLen) + " < EMA" + str.tostring(slowEmaLen)
+
+// --- Get Dynamic Description Text ---
+// Builds the embed description line based on BOTH direction AND confirmationMode.
+//
+// WHY DYNAMIC? A static "structure reversal confirmation" is vague. When the
+// mode is CHoCHThenBOS or CHoCHThenBOS+EMA, the flip was confirmed by a BOS
+// AFTER the initial CHoCH — that's a meaningfully different (and stronger)
+// confirmation than a simple CHoCH+EMA. The description should reflect that
+// so the trader instantly knows the quality of the signal at a glance.
+getDescriptionText(string dirUpper) =>
+    string modeDesc = switch confirmationMode
+        "CHoCH+EMA"        => "structure reversal + EMA alignment"
+        "CHoCHOnly"        => "structure reversal (CHoCH)"
+        "CHoCHThenBOS"     => "CHoCH → BOS continuation"
+        "CHoCHThenBOS+EMA" => "CHoCH → BOS continuation + EMA alignment"
+        => "structure reversal confirmation"
+    dirUpper + " regime confirmed after " + modeDesc + "."
+
+// --- Get Meaning Text ---
+getMeaningText(string direction) =>
+    direction == "BULLISH"
+         ? "Potential regime shift toward bullish continuation."
+         : "Potential regime shift toward bearish continuation."
+
+// --- Get Action Text ---
+getActionText(string direction) =>
+    direction == "BULLISH"
+         ? "Prefer long bias on pullbacks / retests with confluence."
+         : "Prefer short bias on rallies / retests with confluence."
+
+// --- Get Price-Specific Invalidation Text ---
+// States when the bias weakens, using the ACTUAL broken level price.
+//
+// WHY PRICE-SPECIFIC? "Closes back below the key broken structure" is vague.
+// Including the exact price means the trader can set a stop or watchpoint
+// immediately from the Discord notification without opening the chart.
+//
+// The broken level is:
+//   Bullish flip → the swing HIGH that price broke above
+//   Bearish flip → the swing LOW that price broke below
+getInvalidationText(string direction, float brokenLevel) =>
+    string lvlStr = na(brokenLevel) ? "the key structure level" : str.tostring(brokenLevel, format.mintick)
+    direction == "BULLISH"
+         ? "Invalidate if price closes back below " + lvlStr + " or EMA" + str.tostring(fastEmaLen) + " loses EMA" + str.tostring(slowEmaLen) + "."
+         : "Invalidate if price closes back above " + lvlStr + " or EMA" + str.tostring(fastEmaLen) + " reclaims EMA" + str.tostring(slowEmaLen) + "."
+
+// --- Determine the Broken Level Based on Flip Direction ---
+// Picks the correct swing level that was violated to cause the flip.
+// Bullish flip = price broke ABOVE the swing high → broken level is swingHigh
+// Bearish flip = price broke BELOW the swing low  → broken level is swingLow
+getBrokenLevel(string direction, float swingHighLvl, float swingLowLvl) =>
+    direction == "Bullish" ? swingHighLvl : swingLowLvl
+
+// ============================================================================
+// ALERT PAYLOAD BUILDERS
+// ============================================================================
+// Two output formats controlled by `useEmbeds`:
+//   1) EMBED (default): Rich card with colored sidebar and structured fields
+//   2) CONTENT FALLBACK: Clean markdown for non-Discord webhook targets
+//
+// EMBED COLOR CODES (decimal — Discord requires decimal, not hex):
+//   Green:  3066993  (hex #2ECC71)
+//   Red:   15158332  (hex #E74C3C)
+//   Orange: 16750848  (hex #FFA500)
+// ============================================================================
+
+// --- Build the Embed-Format Flip Alert ---
+buildFlipAlertEmbed(string direction, string triggerEvent, float swingHighLvl, float swingLowLvl) =>
+    // --- Precompute all display values ---
+    string dirUpper    = direction == "Bullish" ? "BULLISH" : "BEARISH"
+    string emoji       = direction == "Bullish" ? "🟢" : "🔴"
+    string colorCode   = direction == "Bullish" ? "3066993" : "15158332"
+    string cls         = str.tostring(close, format.mintick)
+    string highLvl     = na(swingHighLvl) ? "N/A" : str.tostring(swingHighLvl, format.mintick)
+    string lowLvl      = na(swingLowLvl)  ? "N/A" : str.tostring(swingLowLvl,  format.mintick)
+    float  brokenLevel = getBrokenLevel(direction, swingHighLvl, swingLowLvl)
+    string brokenStr   = na(brokenLevel) ? "N/A" : str.tostring(brokenLevel, format.mintick)
+    string trendStr    = trendToString(trendState)
+    string biasStr     = dirUpper
+    string emaDesc     = getEmaDesc()
+    string triggerMode = getTriggerModeLabel()
+    string ts          = formatTimestamp()
+
+    // --- Title and Description ---
+    string title = emoji + " StrikeZone — BIAS FLIP | " + dirUpper
+    string desc  = getDescriptionText(dirUpper)
+
+    // --- Reason field ---
+    // First line: the trigger mode label (matches the user's selected mode)
+    // Below: the raw structure event detail, EMA filter, trend, and bias
+    string reasonVal = "Trigger: " + triggerMode
+         + "\n• " + triggerEvent
+         + "\n• EMA Filter: " + emaDesc
+         + "\n• Structure Trend: " + trendStr
+         + "\n• Bias State: " + biasStr
+
+    // --- Levels field ---
+    // Broken Level first — the most actionable piece of info.
+    // A trader scanning on mobile sees the critical level immediately.
+    string levelsVal = "• Broken Level: " + brokenStr
+         + "\n• Swing High: " + highLvl
+         + "\n• Swing Low: " + lowLvl
+         + "\n• Close: " + cls
+
+    // --- Assemble embed fields ---
+    string f1 = buildEmbedField("Symbol",    syminfo.tickerid,  true)
+    string f2 = buildEmbedField("Timeframe", timeframe.period,  true)
+    string f3 = buildEmbedField("Mode",      confirmationMode,  true)
+    string f4 = buildEmbedField("Reason",    reasonVal,         false)
+    string f5 = buildEmbedField("Levels",    levelsVal,         false)
+
+    // --- Educational fields (compact mode skips these) ---
+    string educationalFields = ""
+    if not compactMode
+        string f6 = buildEmbedField("Meaning",      getMeaningText(dirUpper),                    false)
+        string f7 = buildEmbedField("Action",        getActionText(dirUpper),                     false)
+        string f8 = buildEmbedField("Invalidation",  getInvalidationText(dirUpper, brokenLevel),  false)
+        educationalFields := "," + f6 + "," + f7 + "," + f8
+
+    string f9 = buildEmbedField("Time (GMT)", ts, false)
+
+    // --- Assemble full JSON payload ---
+    string json = '{"content":"",'
+         + '"embeds":[{'
+         + '"title":"' + jsonEscape(title) + '",'
+         + '"description":"' + jsonEscape(desc) + '",'
+         + '"color":' + colorCode + ','
+         + '"fields":[' + f1 + ',' + f2 + ',' + f3 + ',' + f4 + ',' + f5
+         + educationalFields
+         + ',' + f9 + ']'
+         + '}],'
+         + '"allowed_mentions":{"parse":[]}}'
+    json
+
+// --- Build the Content-Fallback Flip Alert ---
+buildFlipAlertContent(string direction, string triggerEvent, float swingHighLvl, float swingLowLvl) =>
+    string dirUpper    = direction == "Bullish" ? "BULLISH" : "BEARISH"
+    string emoji       = direction == "Bullish" ? "🟢" : "🔴"
+    string cls         = str.tostring(close, format.mintick)
+    string highLvl     = na(swingHighLvl) ? "N/A" : str.tostring(swingHighLvl, format.mintick)
+    string lowLvl      = na(swingLowLvl)  ? "N/A" : str.tostring(swingLowLvl,  format.mintick)
+    float  brokenLevel = getBrokenLevel(direction, swingHighLvl, swingLowLvl)
+    string brokenStr   = na(brokenLevel) ? "N/A" : str.tostring(brokenLevel, format.mintick)
+    string trendStr    = trendToString(trendState)
+    string emaDesc     = getEmaDesc()
+    string triggerMode = getTriggerModeLabel()
+    string ts          = formatTimestamp()
+
+    string txt = emoji + " **StrikeZone — BIAS FLIP | " + dirUpper + "**"
+         + "\n"
+         + "\n" + getDescriptionText(dirUpper)
+         + "\n**Symbol:** " + syminfo.tickerid
+         + "\n**TF:** " + timeframe.period
+         + "\n**Mode:** " + confirmationMode
+         + "\n"
+         + "\n**Reason:**"
+         + "\nTrigger: " + triggerMode
+         + "\n• " + triggerEvent
+         + "\n• EMA Filter: " + emaDesc
+         + "\n• Structure Trend: " + trendStr
+         + "\n• Bias State: " + dirUpper
+         + "\n"
+         + "\n**Levels:**"
+         + "\n• Broken Level: " + brokenStr
+         + "\n• Swing High: " + highLvl
+         + "\n• Swing Low: " + lowLvl
+         + "\n• Close: " + cls
+
+    if not compactMode
+        txt += "\n"
+             + "\n**Meaning:** " + getMeaningText(dirUpper)
+             + "\n**Action:** " + getActionText(dirUpper)
+             + "\n**Invalidation:** " + getInvalidationText(dirUpper, brokenLevel)
+
+    txt += "\n"
+         + "\n**Time (GMT):** " + ts
+
+    '{"content":"' + jsonEscape(txt) + '","allowed_mentions":{"parse":[]}}'
+
+// --- Unified Flip Alert Router ---
+// Signature unchanged — Section 10 doesn't need any edits.
+buildFlipAlertJson(string direction, string triggerEvent, float swingHighLvl, float swingLowLvl) =>
+    useEmbeds
+         ? buildFlipAlertEmbed(direction, triggerEvent, swingHighLvl, swingLowLvl)
+         : buildFlipAlertContent(direction, triggerEvent, swingHighLvl, swingLowLvl)
+
+// --- Build Early Warning Alert (Embed Version) ---
+buildEarlyWarningEmbed(string direction, string eventType) =>
+    string dirUpper  = direction == "Bullish" ? "BULLISH" : "BEARISH"
+    string cls       = str.tostring(close, format.mintick)
+    string emaDesc   = getEmaDesc()
+    string trendStr  = trendToString(trendState)
+    string ts        = formatTimestamp()
+
+    string title = "⚠️ StrikeZone — EARLY WARNING | " + dirUpper
+    string desc  = "Structure event detected. Awaiting full bias confirmation."
+
+    string f1 = buildEmbedField("Symbol",    syminfo.tickerid, true)
+    string f2 = buildEmbedField("Timeframe", timeframe.period, true)
+    string f3 = buildEmbedField("Mode",      confirmationMode, true)
+    string f4 = buildEmbedField("Event",     direction + " " + eventType + " detected", false)
+    string f5 = buildEmbedField("EMA State", emaDesc, true)
+    string f6 = buildEmbedField("Structure", trendStr, true)
+    string f7 = buildEmbedField("Close",     cls, true)
+    string f8 = buildEmbedField("Status",    "⚠️ NOT a confirmed bias flip. Do not trade this alone.", false)
+    string f9 = buildEmbedField("Time (GMT)", ts, false)
+
+    '{"content":"",'
+         + '"embeds":[{'
+         + '"title":"' + jsonEscape(title) + '",'
+         + '"description":"' + jsonEscape(desc) + '",'
+         + '"color":16750848,'
+         + '"fields":[' + f1 + ',' + f2 + ',' + f3 + ',' + f4 + ',' + f5 + ',' + f6 + ',' + f7 + ',' + f8 + ',' + f9 + ']'
+         + '}],'
+         + '"allowed_mentions":{"parse":[]}}'
+
+// --- Build Early Warning Alert (Content Fallback) ---
+buildEarlyWarningContent(string direction, string eventType) =>
+    string dirUpper = direction == "Bullish" ? "BULLISH" : "BEARISH"
+    string cls      = str.tostring(close, format.mintick)
+    string emaDesc  = getEmaDesc()
+    string trendStr = trendToString(trendState)
+    string ts       = formatTimestamp()
+
+    string txt = "⚠️ **StrikeZone — EARLY WARNING | " + dirUpper + "**"
+         + "\n"
+         + "\n**Event:** " + direction + " " + eventType + " detected"
+         + "\n**Symbol:** " + syminfo.tickerid + " • **TF:** " + timeframe.period
+         + "\n**Mode:** " + confirmationMode
+         + "\n**EMA:** " + emaDesc + " • **Structure:** " + trendStr
+         + "\n**Close:** " + cls
+         + "\n"
+         + "\n⚠️ *NOT a confirmed bias flip. Do not trade this alone.*"
+         + "\n**Time (GMT):** " + ts
+
+    '{"content":"' + jsonEscape(txt) + '","allowed_mentions":{"parse":[]}}'
+
+// --- Unified Early Warning Router ---
+buildEarlyWarningJson(string direction, string eventType) =>
+    useEmbeds
+         ? buildEarlyWarningEmbed(direction, eventType)
+         : buildEarlyWarningContent(direction, eventType)
+
+
+// ============================================================================
+// SECTION 6: SWING DETECTION (MSA Engine)
+// ============================================================================
+// This section is lifted directly from the MSA v2 logic.
+//
+// HOW PIVOTS WORK:
+// ta.pivothigh(high, leftBars, rightBars) looks at a window of bars:
+//   [leftBars bars to the left] [PIVOT BAR] [rightBars bars to the right]
+//
+// If the pivot bar's HIGH is higher than ALL bars in the window, it's confirmed
+// as a swing high. The catch: it takes `rightBars` bars AFTER the actual high
+// to confirm it. This is called the "pivot lag."
+//
+// Example with swingLen=5:
+//   Bar 100 makes a high of 50000 (highest in range)
+//   Bar 105: We NOW confirm that bar 100 was a swing high (5 bars later)
+//
+// This lag is actually GOOD for non-repainting. The pivot is only detected
+// after it's already confirmed by subsequent price action.
+// ============================================================================
+
+// Update swing levels when new pivots are detected
+// Note: pivotHigh/pivotLow were calculated at global scope in Section 3
+if not na(pivotHigh)
+    lastSwingHighLevel := pivotHigh
+    lastSwingHighBar   := bar_index - swingLen   // Adjust for pivot lag
+
+if not na(pivotLow)
+    lastSwingLowLevel := pivotLow
+    lastSwingLowBar   := bar_index - swingLen
+
+
+// ============================================================================
+// SECTION 7: STRUCTURE BREAK DETECTION (MSA Engine)
+// ============================================================================
+// Now we check if price has broken any of our tracked swing levels.
+//
+// THE STATE MACHINE LOGIC:
+//   If trendState is +1 (bullish) and price breaks above swing high → BOS (continuation)
+//   If trendState is -1 (bearish) and price breaks above swing high → CHoCH (reversal!)
+//   If trendState is -1 (bearish) and price breaks below swing low  → BOS (continuation)
+//   If trendState is +1 (bullish) and price breaks below swing low  → CHoCH (reversal!)
+//
+// BOS = "The trend is continuing, as expected"
+// CHoCH = "Something changed! The other side is gaining control"
+//
+// This is the exact same logic used in Smart Money Concept (SMC) trading.
+// ============================================================================
+
+float buffer = getAtrBuffer()
+
+// Gate evaluation behind bar close if required (non-repaint protection)
+bool canEvaluate = requireBarClose ? barstate.isconfirmed : true
+
+// Event flags — reset every bar (no `var` here, intentionally)
+bool bullishBOS  = false
+bool bearishBOS  = false
+bool bullishCHoCH = false
+bool bearishCHoCH = false
+
+if canEvaluate
+    // --- Check UPSIDE break (price broke above last swing high) ---
+    // IMPORTANT: We use `else if` between upside and downside checks.
+    //
+    // WHY? On extremely volatile bars (flash crashes, news spikes), a single
+    // candle's wick can breach BOTH the swing high AND swing low. With two
+    // separate `if` blocks, both a bullish AND bearish event would fire on
+    // the same bar — creating contradictory signals and potentially two
+    // alerts to Discord for the same candle.
+    //
+    // By using `else if`, we enforce: ONE structure event per bar, maximum.
+    //
+    // PRIORITY: Upside break wins if both are possible. Why?
+    //   - If a candle breaks both levels, it closed somewhere. The close
+    //     determines which break is "real" in Close mode.
+    //   - In practice this almost never happens with Close mode (a candle
+    //     can't close above swing high AND below swing low simultaneously).
+    //   - In Wick mode it's theoretically possible, so the priority matters.
+    //   - Upside-first is arbitrary but consistent. The key is predictability.
+    if hasBrokenAbove(lastSwingHighLevel, buffer)
+        if trendState == 1 or trendState == 0
+            bullishBOS := true       // Continuation — already bullish
+        else if trendState == -1
+            bullishCHoCH := true     // REVERSAL — was bearish, now breaking up
+
+    // --- Check DOWNSIDE break (price broke below last swing low) ---
+    // Only evaluated if NO upside break occurred this bar (else if)
+    else if hasBrokenBelow(lastSwingLowLevel, buffer)
+        if trendState == -1 or trendState == 0
+            bearishBOS := true       // Continuation — already bearish
+        else if trendState == 1
+            bearishCHoCH := true     // REVERSAL — was bullish, now breaking down
+
+
+// ============================================================================
+// SECTION 8: TREND STATE UPDATE (MSA Engine)
+// ============================================================================
+// Update the raw structure trendState based on detected events.
+// Also invalidate (reset to na) the broken swing level so we don't
+// re-trigger on the same level next bar.
+//
+// WHY INVALIDATE? Without this, if price stays above the swing high
+// for 10 bars, we'd get 10 BOS signals instead of 1. Setting the level
+// to na forces us to wait for a NEW swing pivot before checking again.
+// ============================================================================
+
+// We capture the swing levels BEFORE invalidation so they can be
+// referenced in alert messages and bias logic below.
+float eventSwingHigh = lastSwingHighLevel
+float eventSwingLow  = lastSwingLowLevel
+
+// IMPORTANT: These are chained with `else if` to ensure exactly ONE
+// state transition per bar. Combined with the Section 7 patch (which
+// already ensures only one event flag is true), this is belt-and-suspenders
+// safety. If somehow two flags were both true (shouldn't happen with the
+// else-if in Section 7, but defensive coding means planning for "shouldn't"),
+// only the first matching block executes.
+//
+// PRIORITY ORDER: bullishBOS → bearishBOS → bullishCHoCH → bearishCHoCH
+// BOS is checked first because if both a BOS and CHoCH fired (impossible
+// with current logic, but future-proofing), continuation is the safer assumption.
+if bullishBOS
+    trendState         := 1
+    lastSwingHighLevel := na
+    lastSwingHighBar   := na
+
+else if bearishBOS
+    trendState        := -1
+    lastSwingLowLevel := na
+    lastSwingLowBar   := na
+
+else if bullishCHoCH
+    trendState         := 1
+    lastSwingHighLevel := na
+    lastSwingHighBar   := na
+
+else if bearishCHoCH
+    trendState        := -1
+    lastSwingLowLevel := na
+    lastSwingLowBar   := na
+
+
+// ============================================================================
+// SECTION 9: BIAS FLIP LOGIC (THE CORE INNOVATION)
+// ============================================================================
+// This is where the indicator adds value beyond raw MSA signals.
+//
+// Raw BOS/CHoCH events happen frequently and many are noise. The bias flip
+// system FILTERS these through confirmation requirements (EMA alignment,
+// BOS follow-through) to produce high-confidence regime change signals.
+//
+// CONFIRMATION MODES EXPLAINED:
+//
+// 1) "CHoCH+EMA" (DEFAULT, RECOMMENDED):
+//    Bias flips when: CHoCH occurs AND EMA fast/slow alignment agrees.
+//    Example: Bullish CHoCH fires + EMA 21 is above EMA 55 → BULLISH FLIP
+//    This filters out CHoCH signals that occur against the broader trend.
+//
+// 2) "CHoCHOnly":
+//    Bias flips immediately on any CHoCH. No EMA filter.
+//    Fastest response but most false signals. Good for scalpers who want
+//    to react to every potential reversal and filter manually.
+//
+// 3) "CHoCHThenBOS":
+//    CHoCH sets a "pending" flip. Bias only actually flips when a BOS
+//    follows in the same direction. This confirms the reversal with
+//    continuation proof.
+//    Example: Bullish CHoCH → pendingFlipDir = +1 → wait → Bullish BOS → FLIP!
+//
+// 4) "CHoCHThenBOS+EMA":
+//    Same as #3, but the confirming BOS bar must also have EMA alignment.
+//    Maximum confirmation. Fewest signals but highest conviction.
+//
+// COOLDOWN: After any flip, we wait minBarsBetweenFlips before allowing
+// another. This prevents rapid flip-flopping in consolidation zones.
+// ============================================================================
+
+// Cooldown check: have enough bars passed since last flip?
+bool cooldownClear = (bar_index - lastFlipBar) > minBarsBetweenFlips
+
+// --- Bias Flip Event Flags ---
+bool bullishFlip = false
+bool bearishFlip = false
+string flipTriggerEvent = ""
+
+// --- MODE: CHoCH+EMA (default) ---
+// Within each mode, we use `else if` between bullish and bearish checks.
+// This guarantees at most ONE flip direction per bar per mode.
+if confirmationMode == "CHoCH+EMA"
+    // Bullish flip: CHoCH up + EMA bullish
+    if bullishCHoCH and emaTrend == 1 and cooldownClear and biasState != 1
+        bullishFlip      := true
+        flipTriggerEvent := "CHoCH Bullish + EMA Aligned"
+    // Bearish flip: CHoCH down + EMA bearish (else if = mutually exclusive)
+    else if bearishCHoCH and emaTrend == -1 and cooldownClear and biasState != -1
+        bearishFlip      := true
+        flipTriggerEvent := "CHoCH Bearish + EMA Aligned"
+
+// --- MODE: CHoCHOnly ---
+else if confirmationMode == "CHoCHOnly"
+    if bullishCHoCH and cooldownClear and biasState != 1
+        bullishFlip      := true
+        flipTriggerEvent := "CHoCH Bullish (no EMA filter)"
+    else if bearishCHoCH and cooldownClear and biasState != -1
+        bearishFlip      := true
+        flipTriggerEvent := "CHoCH Bearish (no EMA filter)"
+
+// --- MODE: CHoCHThenBOS ---
+else if confirmationMode == "CHoCHThenBOS"
+    // Step 1: CHoCH sets pending direction
+    // Use else-if here too: if both CHoCH directions fire (shouldn't happen
+    // after Section 7 patch, but defensive), bullish takes priority
+    if bullishCHoCH
+        pendingFlipDir := 1
+    else if bearishCHoCH
+        pendingFlipDir := -1
+
+    // Step 2: BOS in same direction confirms the flip
+    if pendingFlipDir == 1 and bullishBOS and cooldownClear and biasState != 1
+        bullishFlip      := true
+        flipTriggerEvent := "CHoCH → BOS Confirmed Bullish"
+        pendingFlipDir   := 0   // Clear pending state
+    else if pendingFlipDir == -1 and bearishBOS and cooldownClear and biasState != -1
+        bearishFlip      := true
+        flipTriggerEvent := "CHoCH → BOS Confirmed Bearish"
+        pendingFlipDir   := 0
+
+    // Cancel pending if opposite CHoCH occurs (invalidates the setup)
+    // This runs AFTER the BOS checks above, so a confirming BOS is processed
+    // before we consider cancelling. The else-if prevents double-cancel.
+    if pendingFlipDir == 1 and bearishCHoCH
+        pendingFlipDir := -1   // Overwrite with new direction
+    else if pendingFlipDir == -1 and bullishCHoCH
+        pendingFlipDir := 1
+
+// --- MODE: CHoCHThenBOS+EMA ---
+else if confirmationMode == "CHoCHThenBOS+EMA"
+    // Step 1: CHoCH sets pending direction
+    if bullishCHoCH
+        pendingFlipDir := 1
+    else if bearishCHoCH
+        pendingFlipDir := -1
+
+    // Step 2: BOS in same direction + EMA alignment confirms
+    if pendingFlipDir == 1 and bullishBOS and emaTrend == 1 and cooldownClear and biasState != 1
+        bullishFlip      := true
+        flipTriggerEvent := "CHoCH → BOS + EMA Confirmed Bullish"
+        pendingFlipDir   := 0
+    else if pendingFlipDir == -1 and bearishBOS and emaTrend == -1 and cooldownClear and biasState != -1
+        bearishFlip      := true
+        flipTriggerEvent := "CHoCH → BOS + EMA Confirmed Bearish"
+        pendingFlipDir   := 0
+
+    // Cancel pending if opposite CHoCH occurs
+    if pendingFlipDir == 1 and bearishCHoCH
+        pendingFlipDir := -1
+    else if pendingFlipDir == -1 and bullishCHoCH
+        pendingFlipDir := 1
+
+// ============================================================================
+// CONFLICT RESOLVER (Belt-and-Suspenders Safety Net)
+// ============================================================================
+// After all mode logic, we check for the "impossible" case: both bullishFlip
+// and bearishFlip are true on the same bar.
+//
+// WHY THIS EXISTS:
+// The else-if chains above should make this impossible. But in production code
+// that sends real alerts to Discord (which traders act on with real money),
+// "should be impossible" isn't good enough. We need a hard guarantee.
+//
+// RESOLUTION STRATEGY:
+// If both are true, we use emaTrend as the tiebreaker:
+//   - If EMA is bullish → keep bullishFlip, cancel bearishFlip
+//   - If EMA is bearish → keep bearishFlip, cancel bullishFlip
+//   - If somehow EMA gives no clear answer → block BOTH flips (do nothing)
+//
+// The philosophy: when in doubt, defer to the higher-timeframe trend (EMA),
+// and if even THAT is ambiguous, do nothing. Missing one signal is always
+// better than sending a wrong signal.
+//
+// In practice, this block should NEVER execute. If it does, the debug plot
+// "Conflict Detected" will show 1 on that bar so you can investigate.
+// ============================================================================
+
+bool conflictDetected = false
+
+if bullishFlip and bearishFlip
+    conflictDetected := true
+    if emaTrend == 1
+        // EMA says bullish — trust the bullish flip, cancel bearish
+        bearishFlip      := false
+        flipTriggerEvent := flipTriggerEvent + " [CONFLICT: EMA tiebreak → Bull]"
+    else if emaTrend == -1
+        // EMA says bearish — trust the bearish flip, cancel bullish
+        bullishFlip      := false
+        flipTriggerEvent := flipTriggerEvent + " [CONFLICT: EMA tiebreak → Bear]"
+    else
+        // EMA is ambiguous — block both, don't flip at all
+        bullishFlip      := false
+        bearishFlip      := false
+        flipTriggerEvent := "BLOCKED: Conflicting signals, no flip"
+
+
+// ============================================================================
+// SECTION 10: BIAS STATE UPDATE & ALERT DISPATCH
+// ============================================================================
+// When a flip is confirmed, we:
+//   1) Update biasState to the new direction
+//   2) Record the bar index for cooldown tracking
+//   3) Draw a label on the chart
+//   4) Fire the Discord webhook alert
+//
+// For early warnings (optional), we fire a separate alert on CHoCH events
+// even when they haven't triggered a full bias flip yet.
+// ============================================================================
+
+// --- Process Bullish Flip ---
+if bullishFlip
+    biasState   := 1
+    lastFlipBar := bar_index
+
+    // Draw flip label
+    if showFlipLabels
+        label newLabel = label.new(
+             x         = bar_index,
+             y         = low,
+             text      = "BIAS FLIP ↑",
+             style     = label.style_label_up,
+             color     = COLOR_FLIP_BULL,
+             textcolor = color.white,
+             size      = getLabelSize())
+        array.push(flipLabels, newLabel)
+
+    // Fire alert
+    if enableAlerts and alertBullFlip
+        string jsonMsg = buildFlipAlertJson("Bullish", flipTriggerEvent, eventSwingHigh, eventSwingLow)
+        alert(jsonMsg, alert.freq_once_per_bar_close)
+
+// --- Process Bearish Flip ---
+if bearishFlip
+    biasState   := -1
+    lastFlipBar := bar_index
+
+    if showFlipLabels
+        label newLabel = label.new(
+             x         = bar_index,
+             y         = high,
+             text      = "BIAS FLIP ↓",
+             style     = label.style_label_down,
+             color     = COLOR_FLIP_BEAR,
+             textcolor = color.white,
+             size      = getLabelSize())
+        array.push(flipLabels, newLabel)
+
+    if enableAlerts and alertBearFlip
+        string jsonMsg = buildFlipAlertJson("Bearish", flipTriggerEvent, eventSwingHigh, eventSwingLow)
+        alert(jsonMsg, alert.freq_once_per_bar_close)
+
+// --- Early Warning Alerts (optional) ---
+// These fire on CHoCH events REGARDLESS of whether they trigger a bias flip.
+// Useful for traders who want a "heads up" before the full confirmation.
+if enableEarlyWarning and enableAlerts
+    if bullishCHoCH and not bullishFlip
+        string ewJson = buildEarlyWarningJson("Bullish", "CHoCH")
+        alert(ewJson, alert.freq_once_per_bar_close)
+    if bearishCHoCH and not bearishFlip
+        string ewJson = buildEarlyWarningJson("Bearish", "CHoCH")
+        alert(ewJson, alert.freq_once_per_bar_close)
+
+
+// ============================================================================
+// SECTION 11: VISUAL RENDERING
+// ============================================================================
+// Good visuals turn a good indicator into a GREAT one. The goal is to give
+// the trader an instant "at a glance" understanding of the current state.
+//
+// We render:
+//   1) Background shading (faint green/red for current bias)
+//   2) EMA lines (so the user can see trend alignment)
+//   3) Swing level lines (current structure boundaries)
+//   4) Info panel table (dashboard showing all states)
+// ============================================================================
+
+// --- Cleanup Old Labels ---
+cleanupOldLabels(flipLabels, maxEventsToKeep)
+
+// --- Background Shading ---
+color bgColor = na
+if showBgShading
+    bgColor := switch biasState
+        1  => COLOR_BG_BULL
+        -1 => COLOR_BG_BEAR
+        => na
+bgcolor(bgColor, title="Bias State Background")
+
+// --- EMA Lines ---
+plot(showEMAs ? emaFast : na, "EMA Fast", color = color.new(color.blue,   0), linewidth = 2)
+plot(showEMAs ? emaSlow : na, "EMA Slow", color = color.new(color.orange, 0), linewidth = 2)
+
+// --- Swing Level Lines ---
+// We only update these on the last (rightmost) bar for performance.
+// Drawing on every bar would create thousands of unnecessary line objects.
+if showSwingLevels and barstate.islast
+    // Delete old lines before drawing new ones
+    if not na(activeHighLine)
+        line.delete(activeHighLine)
+    if not na(activeLowLine)
+        line.delete(activeLowLine)
+
+    if not na(lastSwingHighLevel)
+        activeHighLine := line.new(
+             x1    = lastSwingHighBar,
+             y1    = lastSwingHighLevel,
+             x2    = bar_index,
+             y2    = lastSwingHighLevel,
+             color = COLOR_SWING_HIGH,
+             width = 1,
+             style = line.style_dashed)
+
+    if not na(lastSwingLowLevel)
+        activeLowLine := line.new(
+             x1    = lastSwingLowBar,
+             y1    = lastSwingLowLevel,
+             x2    = bar_index,
+             y2    = lastSwingLowLevel,
+             color = COLOR_SWING_LOW,
+             width = 1,
+             style = line.style_dashed)
+
+
+// ============================================================================
+// SECTION 12: STATUS PANEL (Info Table)
+// ============================================================================
+// The status panel is a small table in the top-right corner of the chart.
+// It shows the current state of all three engines at a glance.
+//
+// WHY A TABLE? Because the bias state, EMA trend, and structure trend can
+// all be different at any given time. The table lets the trader see:
+//   "Oh, structure is bullish but EMA is still bearish — that's why we
+//    haven't flipped yet."
+//
+// We only draw the table on the LAST bar (barstate.islast) for performance.
+// Tables are expensive to render, so we don't want to recreate them on
+// every historical bar.
+// ============================================================================
+
+if showInfoPanel and barstate.islast
+    var table infoTable = table.new(
+         position = position.top_right,
+         columns  = 2,
+         rows     = 7,
+         bgcolor  = color.new(color.black, 30),
+         frame_color   = color.gray,
+         frame_width   = 1,
+         border_color  = color.gray,
+         border_width  = 1)
+
+    // --- Header ---
+    table.cell(infoTable, 0, 0, "StrikeZone Bias",
+         text_color = color.white,
+         text_size  = size.small,
+         bgcolor    = color.new(color.gray, 50))
+    table.cell(infoTable, 1, 0, "",
+         bgcolor = color.new(color.gray, 50))
+
+    // --- Bias State (the big one) ---
+    color biasColor = switch biasState
+        1  => color.green
+        -1 => color.red
+        => color.gray
+    table.cell(infoTable, 0, 1, "Bias",
+         text_color = color.white, text_size = size.small)
+    table.cell(infoTable, 1, 1, biasToString(biasState),
+         text_color = biasColor,  text_size = size.small)
+
+    // --- EMA Trend ---
+    color emaColor = emaTrend == 1 ? color.green : color.red
+    table.cell(infoTable, 0, 2, "EMA Trend",
+         text_color = color.white, text_size = size.small)
+    table.cell(infoTable, 1, 2, emaTrendToString(emaTrend),
+         text_color = emaColor,  text_size = size.small)
+
+    // --- Structure Trend ---
+    color structColor = switch trendState
+        1  => color.green
+        -1 => color.red
+        => color.gray
+    table.cell(infoTable, 0, 3, "Structure",
+         text_color = color.white, text_size = size.small)
+    table.cell(infoTable, 1, 3, trendToString(trendState),
+         text_color = structColor, text_size = size.small)
+
+    // --- Mode ---
+    table.cell(infoTable, 0, 4, "Mode",
+         text_color = color.white, text_size = size.small)
+    table.cell(infoTable, 1, 4, confirmationMode,
+         text_color = color.yellow, text_size = size.small)
+
+    // --- Swing High ---
+    string shTxt = na(lastSwingHighLevel) ? "—" : str.tostring(lastSwingHighLevel, "#.####")
+    table.cell(infoTable, 0, 5, "Swing High",
+         text_color = color.white, text_size = size.small)
+    table.cell(infoTable, 1, 5, shTxt,
+         text_color = COLOR_SWING_HIGH, text_size = size.small)
+
+    // --- Swing Low ---
+    string slTxt = na(lastSwingLowLevel) ? "—" : str.tostring(lastSwingLowLevel, "#.####")
+    table.cell(infoTable, 0, 6, "Swing Low",
+         text_color = color.white, text_size = size.small)
+    table.cell(infoTable, 1, 6, slTxt,
+         text_color = COLOR_SWING_LOW, text_size = size.small)
+
+
+// ============================================================================
+// SECTION 13: DEBUG / HIDDEN PLOTS
+// ============================================================================
+// These plots are hidden by default but can be enabled in indicator settings.
+// They're invaluable for debugging:
+//   - Apply indicator to chart
+//   - Open Settings → Style tab
+//   - Check the boxes next to these plots
+//   - Now you can see the raw numeric values in the data window
+//
+// Pine Script's "display=display.none" hides them from the chart but they
+// still appear in the Settings panel and Data Window (press D on keyboard).
+// ============================================================================
+
+plot(biasState,          "Bias State",        color = color.purple, display = display.none)
+plot(trendState,         "Trend State",       color = color.gray,   display = display.none)
+plot(emaTrend,           "EMA Trend",         color = color.blue,   display = display.none)
+plot(pendingFlipDir,     "Pending Flip",      color = color.yellow, display = display.none)
+plot(lastSwingHighLevel, "Last Swing High",   color = COLOR_SWING_HIGH, display = display.none)
+plot(lastSwingLowLevel,  "Last Swing Low",    color = COLOR_SWING_LOW,  display = display.none)
+plot(conflictDetected ? 1 : 0, "Conflict Detected", color = color.fuchsia, display = display.none)
+
+
+// ============================================================================
+// END OF INDICATOR
+// ============================================================================
+//
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                        VALIDATION CHECKLIST                            ║
+// ╠══════════════════════════════════════════════════════════════════════════╣
+// ║                                                                        ║
+// ║  Test on: BTC/USDT, ETH/USDT, SOL/USDT — 15m and 1H timeframes       ║
+// ║                                                                        ║
+// ║  [ ] Indicator loads without runtime errors on all tickers             ║
+// ║  [ ] Background shading appears and matches biasState                  ║
+// ║  [ ] BIAS FLIP labels appear at correct locations                      ║
+// ║  [ ] Flip fires ONLY once per confirmed flip (not repeated bars)       ║
+// ║  [ ] Cooldown enforced: no flips within minBarsBetweenFlips bars       ║
+// ║  [ ] requireBarClose ON → no repainting (signals don't disappear)     ║
+// ║  [ ] CHoCH+EMA mode: flips only when both CHoCH AND EMA align         ║
+// ║  [ ] CHoCHOnly mode: flips on any CHoCH regardless of EMA             ║
+// ║  [ ] CHoCHThenBOS mode: CHoCH alone does NOT flip; needs BOS follow   ║
+// ║  [ ] CHoCHThenBOS+EMA: needs BOS follow + EMA alignment               ║
+// ║  [ ] Status panel shows correct values for all three states            ║
+// ║  [ ] EMA lines plot correctly and match expected 21/55 behavior        ║
+// ║  [ ] Swing level dashed lines appear at valid pivot points             ║
+// ║  [ ] Early warning alerts (if enabled) fire on CHoCH without flip     ║
+// ║  [ ] JSON payload is valid (test with jsonlint.com)                    ║
+// ║  [ ] Discord webhook receives and renders the message correctly        ║
+// ║  [ ] No "na" errors or "index out of bounds" in Pine Script console    ║
+// ║  [ ] Works on stocks (AAPL), forex (EURUSD), and crypto (BTC)         ║
+// ║                                                                        ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+//
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                        WEBHOOK SETUP (Discord)                         ║
+// ╠══════════════════════════════════════════════════════════════════════════╣
+// ║                                                                        ║
+// ║  1. Add this indicator to your TradingView chart                       ║
+// ║  2. Right-click the indicator name → "Add Alert..."                    ║
+// ║     OR: Click the alarm clock icon → Create Alert                      ║
+// ║  3. Set Condition:                                                     ║
+// ║     - First dropdown: "StrikeZone — Bias Flip (MSA + EMA) v6"         ║
+// ║     - Second dropdown: "Any alert() function call"                     ║
+// ║  4. In the "Message" box: LEAVE IT EMPTY                               ║
+// ║     (The JSON payload is built entirely inside the Pine Script code.   ║
+// ║      If you type anything here, it will OVERRIDE the code's payload    ║
+// ║      and your Discord message will be wrong.)                          ║
+// ║  5. Go to "Notifications" tab → enable "Webhook URL"                   ║
+// ║  6. Paste your Discord webhook URL:                                    ║
+// ║     https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN                ║
+// ║  7. Click "Create"                                                     ║
+// ║                                                                        ║
+// ║  HOW TO GET A DISCORD WEBHOOK URL:                                     ║
+// ║  - Go to your Discord server → Channel Settings → Integrations         ║
+// ║  - Click "Webhooks" → "New Webhook"                                    ║
+// ║  - Name it (e.g., "StrikeZone Alerts")                                ║
+// ║  - Copy the Webhook URL                                                ║
+// ║                                                                        ║
+// ║  TESTING:                                                              ║
+// ║  - Set alert to trigger "Once" first to test the payload               ║
+// ║  - Check Discord for the formatted message                             ║
+// ║  - If it works, recreate with "Every time ... closes" for live use     ║
+// ║                                                                        ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
